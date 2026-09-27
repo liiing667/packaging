@@ -3747,3 +3747,269 @@ class TestSpecifierSetToRangeEquivalence:
                 version,
             )
             assert spec_set.contains(version) == version_range.contains(version)
+
+
+class TestSpecifierSetContainsPrereleaseContract:
+    """Pinned decision matrix for ``SpecifierSet.contains``.
+
+    The resolver's version selection depends on these exact outcomes, so each
+    row is a commitment, annotated with the PEP 440 rule it derives from.
+    Columns are the three values of the ``prereleases`` argument:
+    ``None`` (default), ``True`` and ``False``.
+
+    Rows where the spec text and this implementation admit different
+    readings are *not* here; they live in
+    :class:`TestCommittedSpecInterpretations` with the full reasoning.
+    """
+
+    @pytest.mark.parametrize(
+        ("specifier", "version", "default", "pre_true", "pre_false"),
+        [
+            # --- >=1.0rc1: a specifier naming a prerelease opts the whole
+            # set into prereleases (PEP 440: "if a specifier ... includes a
+            # pre-release ... then pre-releases are allowed").
+            (">=1.0rc1", "1.0", True, True, True),
+            (">=1.0rc1", "1.0rc1", True, True, False),
+            (">=1.0rc1", "1.0rc2", True, True, False),
+            # 1.0rc1.dev1 < 1.0rc1 and 1.0.dev1 < 1.0rc1: below the bound.
+            (">=1.0rc1", "1.0rc1.dev1", False, False, False),
+            (">=1.0rc1", "1.0.dev1", False, False, False),
+            (">=1.0rc1", "1.0a1", False, False, False),
+            (">=1.0rc1", "0.9.9", False, False, False),
+            # Above the bound; a prerelease candidate needs the opt-in.
+            (">=1.0rc1", "2.0a1", True, True, False),
+            # --- ~=1.2 is >=1.2, ==1.* (PEP 440 compatible release).
+            ("~=1.2", "1.2", True, True, True),
+            ("~=1.2", "1.5", True, True, True),
+            ("~=1.2", "2.0", False, False, False),
+            ("~=1.2", "1.1", False, False, False),
+            # 1.2rc1 < 1.2: the lower bound rejects it even when
+            # prereleases are explicitly allowed.
+            ("~=1.2", "1.2rc1", False, False, False),
+            ("~=1.2", "2.0rc1", False, False, False),
+            # ~=1.2.0 is >=1.2.0, ==1.2.*: the compatible-release upper
+            # bound moves with the number of pinned release segments.
+            ("~=1.2.0", "1.2.5", True, True, True),
+            ("~=1.2.0", "1.2.5rc1", True, True, False),
+            ("~=1.2.0", "1.3rc1", False, False, False),
+            ("~=1.2.0", "1.3", False, False, False),
+            # --- ===1.0: arbitrary equality is a (case-insensitive) string
+            # comparison, no version semantics at all (PEP 440).
+            ("===1.0", "1.0", True, True, True),
+            ("===1.0", "1.0.0", False, False, False),
+            ("===1.0", "1.0+local", False, False, False),
+            ("===1.0", "1.0rc1", False, False, False),
+            # A prerelease-valued === candidate is still gated by
+            # prereleases=False; the string match itself is unaffected.
+            ("===1.0rc1", "1.0rc1", True, True, False),
+            ("===1.0rc1", "1.0RC1", True, True, False),
+            # === accepts arbitrary strings, compared case-insensitively.
+            ("===foobar", "foobar", True, True, True),
+            ("===foobar", "FOOBAR", True, True, True),
+            # --- !=1.0.* / ==1.0.*: prefix matching is on the release
+            # segment, zero-padded (PEP 440), and covers prereleases of the
+            # matching series when prereleases are allowed at all.
+            ("!=1.0.*", "1.0", False, False, False),
+            ("!=1.0.*", "1.0.0", False, False, False),
+            ("!=1.0.*", "1.0.1", False, False, False),
+            ("!=1.0.*", "1.0.1rc1", False, False, False),
+            ("!=1.0.*", "1.0rc1", False, False, False),
+            ("!=1.0.*", "1.1", True, True, True),
+            ("==1.0.*", "1.0", True, True, True),
+            ("==1.0.*", "1.0.0", True, True, True),
+            ("==1.0.*", "1.0.0.0", True, True, True),
+            ("==1.0.*", "1.0.1", True, True, True),
+            ("==1.0.*", "1.0.1rc1", True, True, False),
+            ("==1.0.*", "1.0rc1", True, True, False),
+            ("==1.0.*", "1.0.dev1", True, True, False),
+            # --- != combined with a range: the exclusion applies to the
+            # whole 1.1.* series, including its prereleases.
+            (">=1.0,!=1.1.*", "1.0.9", True, True, True),
+            (">=1.0,!=1.1.*", "1.1", False, False, False),
+            (">=1.0,!=1.1.*", "1.1.5", False, False, False),
+            (">=1.0,!=1.1.*", "1.1.5rc1", False, False, False),
+            (">=1.0,!=1.1.*", "1.1rc1", False, False, False),
+            (">=1.0,!=1.1.*", "1.2", True, True, True),
+            # --- !=1.0rc1 excludes exactly that prerelease; other
+            # prereleases still need the opt-in to be accepted.
+            ("!=1.0rc1", "1.0rc1", False, False, False),
+            ("!=1.0rc1", "1.0rc2", True, True, False),
+            ("!=1.0rc1", "1.0", True, True, True),
+            ("!=1.0rc1", "0.9rc1", True, True, False),
+            # --- Wildcard exclusion inside a wildcard inclusion.
+            ("==1.0.*,!=1.0.2", "1.0.1", True, True, True),
+            ("==1.0.*,!=1.0.2", "1.0.2", False, False, False),
+            ("==1.0.*,!=1.0.2", "1.0.2rc1", True, True, False),
+            # --- Empty set: everything matches, prereleases included by
+            # default (see TestCommittedSpecInterpretations for why).
+            ("", "1.0", True, True, True),
+            ("", "1.0rc1", True, True, False),
+            # --- Exclusive ordered comparisons ignore the boundary
+            # version's own prereleases, post-releases and local segments
+            # (PEP 440): >1.0 means "some later release", not "anything
+            # sorting after 1.0".
+            (">1.0", "1.0.0", False, False, False),
+            (">1.0", "1.0.post1", False, False, False),
+            (">1.0", "1.0+local", False, False, False),
+            (">1.0", "1.0.1", True, True, True),
+            ("<2.0", "2.0.dev1", False, False, False),
+            ("<1.0", "1.0.dev1", False, False, False),
+            ("<1.0", "1.0+local", False, False, False),
+            # --- Inclusive comparisons keep the boundary's local segment
+            # and (for <=) its prereleases.
+            (">=1.0", "1.0+local", True, True, True),
+            ("<=1.0", "1.0+local", True, True, True),
+            ("<=1.0", "1.0.dev1", True, True, False),
+            (">=1.0", "1.0.dev1", False, False, False),
+            # --- Public == ignores the candidate's local segment; public
+            # != excludes the local variants too (PEP 440).
+            ("==1.0", "1.0+local", True, True, True),
+            ("!=1.0", "1.0+local", False, False, False),
+            ("!=1.0", "1.0", False, False, False),
+            ("!=1.0", "1.0.0", False, False, False),
+        ],
+    )
+    def test_contains_prereleases_matrix(
+        self,
+        specifier: str,
+        version: str,
+        default: bool,
+        pre_true: bool,
+        pre_false: bool,
+    ) -> None:
+        spec = SpecifierSet(specifier)
+        assert spec.contains(version) is default
+        assert spec.contains(version, prereleases=True) is pre_true
+        assert spec.contains(version, prereleases=False) is pre_false
+
+    @pytest.mark.parametrize(
+        ("specifier", "expected"),
+        [
+            # A specifier naming a prerelease opts the whole set in.
+            (">=1.0rc1", True),
+            ("===1.0rc1", True),
+            (">=1.0rc1,!=1.5", True),
+            # No specifier names a prerelease: the set has no opinion and
+            # reports None (not False).
+            ("~=1.2", None),
+            ("===1.0", None),
+            ("==1.0.*", None),
+            ("!=1.0rc1", None),
+            ("", None),
+        ],
+    )
+    def test_prereleases_property_autodetection(
+        self, specifier: str, expected: bool | None
+    ) -> None:
+        assert SpecifierSet(specifier).prereleases is expected
+
+    @pytest.mark.parametrize(
+        ("specifier", "expected"),
+        [
+            (">=1.0rc1", True),
+            ("===1.0rc1", True),
+            # An unparsable === version cannot be classified: unknown.
+            ("===foobar", None),
+            ("~=1.2", False),
+            (">=1.0", False),
+            # A wildcard == cannot name a prerelease, so it never opts in.
+            ("==1.0.*", False),
+        ],
+    )
+    def test_specifier_prereleases_detection_contract(
+        self, specifier: str, expected: bool | None
+    ) -> None:
+        assert Specifier(specifier).prereleases is expected
+
+    def test_installed_candidate_overrides_prerelease_gate(self) -> None:
+        # PEP 440: already-installed prereleases are acceptable. The
+        # installed=True flag forces acceptance even when the caller passed
+        # prereleases=False.
+        spec = SpecifierSet("~=1.2")
+        assert spec.contains("1.3rc1", installed=True) is True
+        assert spec.contains("1.3rc1", prereleases=False, installed=True) is True
+        assert spec.contains("1.3rc1", installed=False) is True
+        assert (
+            spec.contains("1.3rc1", prereleases=False, installed=False) is False
+        )
+
+    def test_filter_withdraws_prereleases_when_finals_exist(self) -> None:
+        # PEP 440's resolution rule that contains() cannot express per-item:
+        # over a candidate set, prereleases are only yielded when no final
+        # release satisfies the specifier.
+        spec = SpecifierSet("~=1.2")
+        assert list(spec.filter(["1.2", "1.3rc1", "1.4"])) == ["1.2", "1.4"]
+        assert list(spec.filter(["1.3rc1", "1.4a1"])) == ["1.3rc1", "1.4a1"]
+        assert list(spec.filter(["1.2", "1.3rc1"], prereleases=True)) == [
+            "1.2",
+            "1.3rc1",
+        ]
+
+
+class TestCommittedSpecInterpretations:
+    """Cases where the spec text and this implementation can be read to
+    differ, with the resolution this project commits to.
+
+    Each test documents three things: what the spec says, what the
+    implementation does, and which behavior the resolver commits to. The
+    assertions pin the *committed* behavior. They must not be weakened to
+    match a regression in the implementation; conversely, if a case here is
+    ever reclassified as an implementation bug, the fix belongs in
+    ``src/packaging`` and the case moves into the contract matrix above.
+    """
+
+    def test_contains_default_accepts_prereleases(self) -> None:
+        # Spec: PEP 440 excludes prereleases from matching unless the
+        # specifier names one, the caller opts in, or "no final release
+        # satisfies the specifier" (a rule written for resolution over a
+        # candidate set).
+        # Implementation: since 26.0 (changelog, :pull:`897`), contains()
+        # with prereleases=None treats the single queried version as having
+        # no alternatives, so the "no final release" clause applies and the
+        # prerelease matches. packaging <= 25.x rejected it instead.
+        # Committed: the 26.0 behavior, as documented in the contains()
+        # docstring. Callers that need the old strictness must pass
+        # prereleases=False.
+        assert SpecifierSet("~=1.2").contains("1.3rc1") is True
+        assert SpecifierSet(">=1.0").contains("2.0a1") is True
+        assert SpecifierSet("~=1.2").contains("1.3rc1", prereleases=False) is False
+        assert SpecifierSet(">=1.0").contains("2.0a1", prereleases=False) is False
+
+    def test_arbitrary_equality_compares_the_raw_string(self) -> None:
+        # Spec: PEP 440 defines === as a case-insensitive string comparison
+        # and is silent on whether a parseable candidate is normalized
+        # first.
+        # Implementation: upstream packaging 26.0 parses and normalizes
+        # first, so ===1.0 matches "01.0" and "1.0 " there. This
+        # implementation compares the candidate's raw string (documented in
+        # Specifier.contains), so those do not match; a Version instance is
+        # compared by its normalized str() form.
+        # Committed: raw string comparison for string candidates. ===
+        # exists precisely for versions that are not PEP 440; normalizing
+        # only the parseable ones would make the operator's meaning depend
+        # on the candidate's parseability.
+        spec = SpecifierSet("===1.0")
+        assert spec.contains("1.0") is True
+        assert spec.contains("01.0") is False
+        assert spec.contains("1.0 ") is False
+        assert spec.contains(Version("1.0")) is True
+        assert spec.contains(Version("1.0.0")) is False
+
+    def test_not_equal_never_opts_into_prereleases(self) -> None:
+        # Spec: PEP 440 says a specifier that includes a prerelease version
+        # implicitly allows prereleases. Read literally, !=1.0rc1 includes
+        # one.
+        # Implementation: the != operator is explicitly excluded from that
+        # rule (see Specifier.prereleases) -- an exclusion naming a
+        # prerelease must not opt the whole specifier set into accepting
+        # unrelated prereleases.
+        # Committed: the implementation. Note this only affects the
+        # .prereleases property and filter() defaults; contains() with
+        # prereleases=None accepts prereleases anyway (see
+        # test_contains_default_accepts_prereleases).
+        assert Specifier("!=1.0rc1").prereleases is False
+        assert SpecifierSet("!=1.0rc1").prereleases is None
+        assert SpecifierSet("!=1.0rc1").contains("1.0rc2") is True
+        assert SpecifierSet("!=1.0rc1").contains("1.0rc2", prereleases=False) is False
+        # filter() over mixed candidates still prefers finals by default.
+        assert list(SpecifierSet("!=1.0rc1").filter(["1.0rc2", "1.0"])) == ["1.0"]

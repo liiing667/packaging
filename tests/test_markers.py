@@ -879,3 +879,224 @@ def test_pickle_marker_setstate_rejects_invalid_marker_string() -> None:
     m = Marker.__new__(Marker)
     with pytest.raises(TypeError, match="Cannot restore Marker"):
         m.__setstate__("this is not a valid marker")
+
+
+class TestMarkerEvaluateEnvironmentContract:
+    """Pinned evaluation contexts for ``Marker.evaluate``.
+
+    The resolver evaluates dependency markers once per requested extra, so
+    the exact handling of ``extra``, of extras nested inside compound
+    markers, and of missing platform variables is contractual. Rows where
+    the spec and the implementation admit different readings live in
+    :class:`TestCommittedMarkerInterpretations`.
+    """
+
+    def test_extra_defaults_to_empty_in_metadata_context(self) -> None:
+        # default_environment() carries no "extra"; evaluate() injects
+        # extra="" for context="metadata" (the default).
+        assert "extra" not in default_environment()
+        assert Marker("extra == ''").evaluate() is True
+        assert Marker("extra == 'test'").evaluate() is False
+
+    @pytest.mark.parametrize("context", ["requirement", "lock_file"])
+    def test_extra_missing_outside_metadata_context(self, context: str) -> None:
+        # Outside the metadata context no implicit extra is provided, so a
+        # bare extra marker has nothing to compare against and must fail
+        # loudly rather than silently evaluate to False.
+        with pytest.raises(UndefinedEnvironmentName):
+            Marker("extra == 'test'").evaluate(context=context)
+
+    def test_undefined_environment_name_is_a_key_error(self) -> None:
+        # Callers catching KeyError (the pre-26.1 exception type for a
+        # missing environment key) keep working.
+        assert issubclass(UndefinedEnvironmentName, KeyError)
+
+    @pytest.mark.parametrize("context", ["metadata", "requirement", "lock_file"])
+    def test_extra_explicit_environment_works_in_every_context(
+        self, context: str
+    ) -> None:
+        marker = Marker("extra == 'test'")
+        assert marker.evaluate({"extra": "test"}, context=context) is True
+        assert marker.evaluate({"extra": "docs"}, context=context) is False
+
+    @pytest.mark.parametrize(
+        ("marker_extra", "env_extra"),
+        [
+            ("Foo_Bar", "foo-bar"),
+            ("foo-bar", "Foo.Bar"),
+            ("foo.bar", "FOO-BAR"),
+            ("a--b", "A-.B"),
+        ],
+    )
+    def test_extra_names_normalized_pep685(
+        self, marker_extra: str, env_extra: str
+    ) -> None:
+        # PEP 685: both sides of an extra comparison are normalized with
+        # PEP 503 name semantics before comparing.
+        marker = Marker(f"extra == '{marker_extra}'")
+        assert marker.evaluate({"extra": env_extra}) is True
+
+    def test_extra_none_treated_as_empty(self) -> None:
+        # Backwards compatibility: the API once accepted extra=None.
+        assert Marker("extra == 'test'").evaluate({"extra": None}) is False
+        assert Marker("extra == ''").evaluate({"extra": None}) is True
+
+    def test_nested_extras_in_dependency_chain(self) -> None:
+        # A dependency pulled in via ``pkg[a]`` may itself depend on
+        # ``dep; extra == 'a' or extra == 'b'``; the resolver evaluates that
+        # marker once per extra requested along the chain. Pin the per-extra
+        # outcomes of a compound marker mixing extras and python_version.
+        marker = Marker(
+            "(extra == 'a' or extra == 'b') and python_version >= '3.8'"
+        )
+        assert marker.evaluate({"extra": "a", "python_version": "3.12"}) is True
+        assert marker.evaluate({"extra": "b", "python_version": "3.12"}) is True
+        assert marker.evaluate({"extra": "c", "python_version": "3.12"}) is False
+        assert marker.evaluate({"extra": "a", "python_version": "3.7"}) is False
+
+    def test_nested_extra_normalized_at_parse_time(self) -> None:
+        # Normalization applies to extra literals nested inside groups, not
+        # just top-level comparisons.
+        marker = Marker("(extra == 'Foo_Bar') and python_version > '3'")
+        assert marker.evaluate({"extra": "foo-bar"}) is True
+        assert marker.evaluate({"extra": "foo_bar"}) is True
+
+    def test_single_extra_value_per_evaluation(self) -> None:
+        # extra is a single string per evaluation, never a set: a marker
+        # requiring two extras at once cannot be satisfied by one
+        # evaluation, however the chain is shaped.
+        marker = Marker("extra == 'a' and extra == 'b'")
+        assert marker.evaluate({"extra": "a"}) is False
+        assert marker.evaluate({"extra": "b"}) is False
+
+    def test_extras_set_membership_lock_file_context(self) -> None:
+        marker = Marker("'test' in extras")
+        # lock_file context defaults extras to the empty set.
+        assert marker.evaluate(context="lock_file") is False
+        assert (
+            marker.evaluate({"extras": {"test", "docs"}}, context="lock_file")
+            is True
+        )
+        # Membership literals and environment values are both normalized.
+        assert (
+            Marker("'Test' in extras").evaluate(
+                {"extras": {"test"}}, context="lock_file"
+            )
+            is True
+        )
+
+    def test_extras_set_missing_outside_lock_file_context(self) -> None:
+        # extras/dependency_groups only exist in the lock_file context.
+        with pytest.raises(UndefinedEnvironmentName):
+            Marker("'test' in extras").evaluate()
+        with pytest.raises(UndefinedEnvironmentName):
+            Marker("'test' in extras").evaluate(context="requirement")
+
+    def test_extras_set_rejects_non_membership_comparison(self) -> None:
+        with pytest.raises(UndefinedComparison):
+            Marker("extras == 'test'").evaluate(
+                {"extras": {"test"}}, context="lock_file"
+            )
+
+    def test_python_version_uses_version_comparison(self) -> None:
+        # The classic resolver bug: as strings '3.9' > '3.10', as versions
+        # 3.9 < 3.10. Marker evaluation must compare as versions.
+        assert (
+            Marker("python_version < '3.10'").evaluate({"python_version": "3.9"})
+            is True
+        )
+        assert (
+            Marker("python_version >= '3.8'").evaluate(
+                {"python_version": "3.12"}
+            )
+            is True
+        )
+        assert (
+            Marker("python_version == '3.9.*'").evaluate(
+                {"python_version": "3.9"}
+            )
+            is True
+        )
+
+    def test_python_full_version_allows_prereleases(self) -> None:
+        # Version-valued markers are compared with prereleases=True so that
+        # e.g. a pre-release interpreter satisfies python_full_version
+        # bounds (packaging#523).
+        assert (
+            Marker("python_full_version >= '3.8.0rc1'").evaluate(
+                {"python_full_version": "3.8.0"}
+            )
+            is True
+        )
+        assert (
+            Marker("python_full_version < '3.9.0a1'").evaluate(
+                {"python_full_version": "3.8.0rc1"}
+            )
+            is True
+        )
+
+    def test_partial_environment_overlays_defaults(self) -> None:
+        # A user-supplied environment is merged over default_environment();
+        # platform variables that are missing from it keep their detected
+        # values instead of raising or going empty.
+        env = default_environment()
+        marker = Marker(f"sys_platform == \"{env['sys_platform']}\" and extra == 't'")
+        assert marker.evaluate({"extra": "t"}) is True
+        python_version = Marker(f"python_version == \"{env['python_version']}\"")
+        assert python_version.evaluate({"extra": "t"}) is True
+
+    def test_unknown_marker_name_rejected_at_parse(self) -> None:
+        with pytest.raises(InvalidMarker):
+            Marker("no_such_variable == 'x'")
+
+
+class TestCommittedMarkerInterpretations:
+    """Marker cases where the spec text and this implementation can be read
+    to differ, with the resolution this project commits to.
+
+    Same ground rules as ``TestCommittedSpecInterpretations`` in
+    tests/test_specifiers.py: assertions pin the committed behavior and
+    must not be weakened to match an implementation regression.
+    """
+
+    def test_ordered_comparison_on_non_version_keys(self) -> None:
+        # Spec: PEP 508's grammar allows <, <=, >, >= on any marker
+        # variable; a naive reading makes them plain string comparisons
+        # (so "posix" > "a" would be True).
+        # Implementation: ordered comparison of arbitrary strings is
+        # treated as undefined (changelog 26.0, :pull:`939`): < and > are
+        # always False, <= and >= degrade to equality. Version-valued keys
+        # (python_version, python_full_version, implementation_version,
+        # platform_release) still compare as versions.
+        # Committed: the implementation -- string ordering of values like
+        # os_name carries no portable meaning.
+        assert Marker("os_name > 'a'").evaluate() is False
+        assert Marker("os_name < 'zzz'").evaluate() is False
+        os_name = default_environment()["os_name"]
+        assert Marker(f"os_name >= '{os_name}'").evaluate() is True
+        assert Marker(f"os_name <= '{os_name}'").evaluate() is True
+        assert Marker("os_name >= 'zzz-no-match'").evaluate() is False
+        assert Marker("os_name <= 'aaa-no-match'").evaluate() is False
+
+    def test_ordered_comparison_on_extra_is_false_not_error(self) -> None:
+        # Only == and != are meaningful for extra. Ordered comparisons do
+        # not raise; they evaluate to False (<= / >= still mean equality).
+        assert Marker("extra > 'aaa'").evaluate({"extra": "zzz"}) is False
+        assert Marker("extra < 'zzz'").evaluate({"extra": "aaa"}) is False
+        assert Marker("extra <= 'test'").evaluate({"extra": "test"}) is True
+        assert Marker("extra >= 'test'").evaluate({"extra": "test"}) is True
+
+    def test_missing_environment_key_raises_key_error_subclass(self) -> None:
+        # Spec: the dependency-specifiers spec does not define a result for
+        # evaluating against an environment that lacks a referenced
+        # variable.
+        # Implementation: upstream packaging 26.0 propagates a bare
+        # KeyError; this implementation raises UndefinedEnvironmentName, a
+        # KeyError subclass naming the missing key (changelog,
+        # :pull:`1276`).
+        # Committed: UndefinedEnvironmentName -- same catchability, better
+        # diagnostics.
+        with pytest.raises(KeyError):
+            Marker("extra == 'test'").evaluate(context="requirement")
+        with pytest.raises(UndefinedEnvironmentName):
+            Marker("extra == 'test'").evaluate(context="requirement")
